@@ -1,10 +1,3 @@
-//
-//  ContentView.swift
-//  TestMD
-//
-//  Created by "Leo" (Dmitry) Kuznetsov on 9/19/25.
-//
-
 import SwiftUI
 import SwiftData
 
@@ -17,7 +10,7 @@ struct ContentView: View {
             List {
                 ForEach(items) { item in
                     NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
+                        ItemView(item: item)
                     } label: {
                         Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
                     }
@@ -56,6 +49,25 @@ struct ContentView: View {
             for index in offsets {
                 modelContext.delete(items[index])
             }
+        }
+    }
+}
+
+
+struct ItemView: View {
+    let item: Item
+    static let markdown = Markdown()
+    static let path = Bundle.main.path(forResource: "test", ofType: "md")!
+    static let md = try! String(contentsOfFile: path, encoding: .utf8)
+    var body: some View {
+        let html = Self.markdown.parse(Self.md)
+        // let _ = print("html: (html)")
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
+            HtmlView(html: html)
+                .frame(maxWidth: .infinity,
+                       maxHeight: .infinity,
+                       alignment: .topLeading)
         }
     }
 }

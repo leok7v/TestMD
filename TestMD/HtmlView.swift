@@ -1,0 +1,169 @@
+import SwiftUI
+import WebKit
+
+private func document(_ html: String,
+                      _ css: String,
+                      _ colorScheme: ColorScheme,
+                      _ primary: Color.Resolved,
+                      _ accentColor: Color.Resolved) -> String {
+    let rootColors: String
+    let _ = primary // ignore for now since it is always #000000 or #FFFFFF
+    // which is not what is observed in macOS UI... Hmmm...
+    if colorScheme == .dark {
+        rootColors = ":root { --text-color: #c9d1d9; " +
+                             "--background-color: #0d1117; }"
+    } else {
+        rootColors = ":root { --text-color: #24292e; " +
+                             "--background-color: #fff; }"
+    }
+    return """
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+        \(rootColors)
+        \(css)
+        :root { 
+            color:      var(--text-color);
+            background: var(--background-color);
+        }
+        html, body { margin: 0; padding: 0; }
+        pre { overflow-x: auto; }
+        code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        hr { border: 0; border-top: 1px solid #888; margin: 1.2em 0; }
+        th, td { border: 1px solid #888; padding: 6px 8px; }
+        a { color: \(accentColor.toHtmlHexString()); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        table { border-collapse: collapse; }
+        </style>
+    </head>
+    <body>
+        \(html)
+    </body>
+    </html>
+    """
+}
+
+#if os(iOS)
+import UIKit
+typealias ViewRepresentable = UIViewRepresentable
+typealias Context = UIViewRepresentableContext<HtmlView>
+#else
+import AppKit
+typealias ViewRepresentable = NSViewRepresentable
+typealias Context = NSViewRepresentableContext<HtmlView>
+#endif
+
+struct HtmlView: ViewRepresentable {
+    
+    let html: String
+
+    @Environment(\.self) private var environment
+    @Environment(\.colorScheme) var colorScheme
+
+    @State private var linkColor: Color.Resolved?
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        
+        func webView(_ webView: WKWebView,
+             decidePolicyFor navigationAction: WKNavigationAction,
+             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if navigationAction.navigationType == .linkActivated,
+               let url = navigationAction.request.url {
+                #if os(iOS)
+                UIApplication.shared.open(url, options: [:],
+                                          completionHandler: nil)
+                #else // os(macOS)
+                NSWorkspace.shared.open(url)
+                #endif
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+                
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    
+    static let dark = Bundle.main.path(forResource: "prism-dark",    ofType: "css")!
+    static let lite = Bundle.main.path(forResource: "prism-default", ofType: "css")!
+    
+    static let prism_dark = try! String(contentsOfFile: dark, encoding: .utf8)
+    static let prism_lite = try! String(contentsOfFile: lite, encoding: .utf8)
+
+    func makeView(_ context: Context) -> WKWebView {
+        let inspectable = isDebuggerAttached() || isDebugBuild()
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(inspectable, forKey: "developerExtrasEnabled")
+        let wv = WKWebView(frame: .zero, configuration: config)
+        wv.isInspectable = inspectable
+        #if os(iOS)
+        wv.isOpaque = false
+        wv.backgroundColor = .clear
+        wv.allowsBackForwardNavigationGestures = false
+        wv.scrollView.backgroundColor = .clear
+        wv.scrollView.isScrollEnabled = false
+        wv.scrollView.contentInsetAdjustmentBehavior = .never
+        wv.scrollView.delaysContentTouches = false
+        #else
+        wv.setValue(false, forKey: "drawsBackground")
+        #endif
+        return wv
+    }
+    
+    func update(_ webView: WKWebView, _ context: Context) {
+        let css = colorScheme == .dark ? Self.prism_dark : Self.prism_lite
+        let accentColor = Color.accentColor.resolve(in: environment)
+        let primary = Color.primary.resolve(in: environment)
+        let secondary = Color.secondary.resolve(in: environment)
+        print("primary: \(primary.toHtmlHexString());")
+        print("secondary: \(secondary.toHtmlHexString());")
+        let page = document(html, css, colorScheme, primary, accentColor)
+        DispatchQueue.main.async {
+            webView.loadHTMLString(page, baseURL: Bundle.main.bundleURL)
+        }
+    }
+
+    func makeNSView(context: Context) -> WKWebView { return makeView(context) }
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        webView.navigationDelegate = context.coordinator
+        update(webView, context)
+    }
+
+    func makeUIView(context: Context) -> WKWebView  { return makeView(context) }
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        webView.navigationDelegate = context.coordinator
+        update(webView, context)
+    }
+}
+
+
+func isDebugBuild() -> Bool {
+    #if DEBUG
+        return true
+    #else
+        return false
+    #endif
+}
+
+func isDebuggerAttached() -> Bool {
+    var i = kinfo_proc()
+    var s = MemoryLayout<kinfo_proc>.stride
+    var m: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+    let r = sysctl(&m, UInt32(m.count), &i, &s, nil, 0)
+    guard r == 0 else { return false }
+    return (i.kp_proc.p_flag & P_TRACED) != 0
+}
+
+extension Color.Resolved {
+    func toHtmlHexString() -> String {
+        let r = Int(self.red * 255)
+        let g = Int(self.green * 255)
+        let b = Int(self.blue * 255)
+        return String(format: "#%02lX%02lX%02lX", r, g, b)
+    }
+}
+

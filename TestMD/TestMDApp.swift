@@ -25,7 +25,7 @@ struct TestMDApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView().frame(minWidth: 320, minHeight: 240)
         }
         .modelContainer(sharedModelContainer)
     }
