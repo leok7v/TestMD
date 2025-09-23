@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import WebKit
+import PDFKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
@@ -74,6 +75,117 @@ func generatePDF(_ view: WKWebView) -> Data? {
     return nil
 }
 
+private func paper() -> CGSize {
+    let A4 = CGSize(width: 595, height: 842) // in points
+    let Letter = CGSize(width: 612, height: 792)
+    let LetterRegions: Set<String> = ["US", "CA", "MX", "CL", "CO",
+                                      "CR", "PA", "PE", "PH", "PR"]
+    return LetterRegions.contains(Locale.current.region?.identifier ?? "") ?
+           Letter : A4
+}
+
+@MainActor
+private func getContentHeight(_ webView: WKWebView) async -> CGFloat {
+    do {
+        // JavaScript to get the actual document height
+        let heightScript = """
+            Math.max(
+                document.body.scrollHeight,
+                document.body.offsetHeight,
+                document.documentElement.clientHeight,
+                document.documentElement.scrollHeight,
+                document.documentElement.offsetHeight
+            );
+        """
+        
+        let result = try await webView.evaluateJavaScript(heightScript)
+        if let height = result as? CGFloat {
+            return height
+        } else if let height = result as? Double {
+            return CGFloat(height)
+        } else if let height = result as? Int {
+            return CGFloat(height)
+        } else {
+            print("Unexpected height result type: \(type(of: result))")
+            return 1000 // fallback
+        }
+    } catch {
+        print("Error getting content height: \(error)")
+        return 0 // fallback
+    }
+}
+
+// PDF Header at the moment of implementation looks like this:
+// 0000  25 50 44 46 2d 31 2e 33  0a 25 c4 e5 f2 e5 eb a7  |%PDF-1.3.%......|
+// 0010  f3 a0 d0 c4 c6 0a 33 20  30 20 6f 62 6a 0a 3c 3c  |......3 0 obj.<<|
+// 0020  20 2f 46 69 6c 74 65 72  20 2f 46 6c 61 74 65 44  | /Filter /FlateD|
+// 0030  65 63 6f 64 65 20 2f 4c  65 6e 67 74 68 20 38 34  |ecode /Length 84|
+// 0040  20 3e 3e 0a 73 74 72 65  61 6d 0a 78 01 25 ca c1  | >>.stream.x.%..|
+
+extension Data {
+    func pdfStreamLength() -> Int {
+        let bytes = self.withUnsafeBytes { $0.bindMemory(to: UInt8.self) }
+        let searchLen = Swift.min(self.count, 500)
+        var start = -1 // Find "<<"
+        for i in 0..<(searchLen-1) {
+            if bytes[i] == 0x3c && bytes[i+1] == 0x3c {  // "<<"
+                start = i + 2
+                break
+            }
+        }
+        if start <= 0 { return -1 }
+        var end = -1 // Find ">>"
+        for i in start..<(searchLen-1) {
+            if bytes[i] == 0x3e && bytes[i+1] == 0x3e {  // ">>"
+                end = i
+                break
+            }
+        }
+        if end <= start { return -1 }
+        let dictData = Data(bytes[start..<end]) // Extract between << and >>
+        guard let dictStr = String(data: dictData, encoding: .ascii) else {
+            return -1
+        }
+        if let lengthPos = dictStr.range(of: "/Length ") {
+            let afterLength = dictStr[lengthPos.upperBound...]
+            let numStr = String(afterLength.prefix { $0.isNumber })
+            return Int(numStr) ?? -1
+        }
+        return -1
+    }
+}
+
+extension Data {
+    func hexdump(maxBytes: Int = 3722) {
+        let bytes = self.prefix(maxBytes)
+        var result = ""
+        for offset in stride(from: 0, to: bytes.count, by: 16) {
+            let chunk = bytes[offset..<Swift.min(offset + 16, bytes.count)]
+            result += String(format: "%08x  ", offset)
+            for i in 0..<16 {
+                if i == 8 { result += " " }
+                if i < chunk.count {
+                    let byte = chunk[chunk.startIndex + i]
+                    result += String(format: "%02x ", byte)
+                } else {
+                    result += "   "
+                }
+            }
+            result += " |"
+            for i in 0..<chunk.count {
+                let byte = chunk[chunk.startIndex + i]
+                let char = (byte >= 32 && byte <= 126) ? Character(UnicodeScalar(byte)) : "."
+                result += String(char)
+            }
+            result += "|\n"
+        }
+        if self.count > maxBytes {
+            result += "... (\(self.count - maxBytes) more bytes)\n"
+        }
+        print(result)
+    }
+}
+
 struct ItemView: View {
     let item: Item
     @State var file: URL?
@@ -90,17 +202,62 @@ struct ItemView: View {
                        alignment: .topLeading)
             Button(action: {
                 if let wv = webView {
+                    let size = paper()
                     Task {
-                        do {
-                            let c = WKPDFConfiguration()
-                            let data = try await wv.pdf(configuration: c)
-                            print("PDF generated successfully: \(data.count) bytes")
+                        wv.frame.size.width = size.width
+                        wv.frame.size.height = 0
+                        wv.layoutIfNeeded()
+                        let contentHeight = await getContentHeight(wv)
+                        let pageCount = max(1, Int(ceil(contentHeight / size.height)))
+                        print("\(wv.frame.size.width) x \(contentHeight)")
+                        let doc = PDFDocument()
+                        doc.documentAttributes = [
+                            PDFDocumentAttribute.titleAttribute: "My Document Title",
+                            PDFDocumentAttribute.authorAttribute: "John Doe",
+                            PDFDocumentAttribute.subjectAttribute: "Document Subject Description",
+                            PDFDocumentAttribute.creatorAttribute: "My App Name",
+                            PDFDocumentAttribute.producerAttribute: "My Custom PDF Generator",
+                            PDFDocumentAttribute.creationDateAttribute: Date(),
+                            PDFDocumentAttribute.modificationDateAttribute: Date(),
+                            PDFDocumentAttribute.keywordsAttribute: ["keyword1", "keyword2", "important"]
+                        ]
+                        let c = WKPDFConfiguration()
+                        var y = CGFloat(pageCount) * size.height
+                        c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
+                        let emptyPage = try await wv.pdf(configuration: c)
+                        let empty = emptyPage.pdfStreamLength()
+//                      emptyPage.hexdump()
+                        var count = 0
+                        print("emptyPage: \(emptyPage.count) bytes pdfStreamLength: \(emptyPage.pdfStreamLength())")
+                        for i in 0..<pageCount {
+                            do {
+                                y = CGFloat(i) * size.height
+                                c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
+                                let data = try await wv.pdf(configuration: c)
+                                print("Page[\(i)]: \(data.count) bytes pdfStreamLength: \(data.pdfStreamLength())")
+                                let length = data.pdfStreamLength()
+                                // iOS implementation of WebKit sucks in .pdf() and
+                                // generates 2 empty pages at the end of 7 pages document
+                                if (empty > 0 && length > 0 && length <= empty + 16) {
+                                    // skip empty pages
+                                    // emptyPage.hexdump()
+                                } else {
+                                    let pd = PDFDocument(data: data)
+                                    let page = pd!.page(at: 0)?.copy() as! PDFPage
+                                    doc.insert(page, at: count)
+                                    count += 1
+                                }
+                            } catch {
+                                print("PDF generation error: \(error)")
+                                err = error
+                                break
+                            }
+                        }
+                        if (err == nil) {
+                            print("pageCount: \(pageCount) doc.pageCount: \(doc.pageCount)")
                             file = URL.documentsDirectory.appendingPathComponent("untitled.pdf")
                             try? FileManager.default.removeItem(at: file!)
-                            try? data.write(to: file!)
-                        } catch {
-                            print("PDF generation error: \(error)")
-                            file = nil
+                            doc.write(to: file!)
                         }
                     }
                 }
@@ -111,8 +268,10 @@ struct ItemView: View {
             if let file {
                 HStack {
                     Text("PDF Generated!")
-                    ShareLink(item: file, subject: Text("Subject"),
-                           message: Text("message"))
+                    // if message: != nil and Save To Files choosen on iOS
+                    // message is getting saved as plain text file instead
+                    // of being shown to user
+                    ShareLink(item: file, subject: Text("Subject: abc"))
                 }
             }
 
