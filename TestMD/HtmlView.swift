@@ -59,13 +59,26 @@ typealias Context = NSViewRepresentableContext<HtmlView>
 struct HtmlView: ViewRepresentable {
     
     let html: String
+    var onWebViewReady: ((WKWebView) -> Void)? = nil
 
     @Environment(\.self) private var environment
     @Environment(\.colorScheme) var colorScheme
 
     @State private var linkColor: Color.Resolved?
-
+ 
     class Coordinator: NSObject, WKNavigationDelegate {
+    
+        var parent: HtmlView
+        var webView: WKWebView?
+        
+        init(_ parent: HtmlView) {
+            self.parent = parent
+        }
+        
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            self.webView = webView
+            parent.onWebViewReady?(webView)
+        }
         
         func webView(_ webView: WKWebView,
              decidePolicyFor navigationAction: WKNavigationAction,
@@ -86,7 +99,7 @@ struct HtmlView: ViewRepresentable {
                 
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     static let dark = Bundle.main.path(forResource: "prism-dark",    ofType: "css")!
     static let lite = Bundle.main.path(forResource: "prism-default", ofType: "css")!
@@ -138,8 +151,26 @@ struct HtmlView: ViewRepresentable {
         webView.navigationDelegate = context.coordinator
         update(webView, context)
     }
+
 }
 
+@MainActor
+func toPDF(_ webView: WKWebView) async -> Data? {
+    do {
+        #if os(iOS)
+        let c = WKPDFConfiguration()
+        c.rect = CGRect(x: 0, y: 0, width: 600, height: 800)
+        return try await webView.pdf(configuration: c)
+        #else
+        let c = WKPDFConfiguration()
+        c.rect = CGRect(x: 0, y: 0, width: 600, height: 800)
+        return try await webView.pdf(configuration: c)
+        #endif
+    } catch {
+        print("PDF generation error: \(error)")
+        return nil
+    }
+}
 
 func isDebugBuild() -> Bool {
     #if DEBUG

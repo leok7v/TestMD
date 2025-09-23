@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import WebKit
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
@@ -64,35 +65,57 @@ struct MarkdownlView: View {
     }
 }
 
+let path = Bundle.main.path(forResource: "test", ofType: "md")!
+let md = try! String(contentsOfFile: path, encoding: .utf8)
+let markdown = Markdown()
+let html = markdown.parse(md)
+
+func generatePDF(_ view: WKWebView) -> Data? {
+    return nil
+}
+
 struct ItemView: View {
     let item: Item
-    static let markdown = Markdown()
-    static let path = Bundle.main.path(forResource: "test", ofType: "md")!
-    static let md = try! String(contentsOfFile: path, encoding: .utf8)
-    @State private var pdfURL: URL?
+    @State var file: URL?
+    @State var err: Error?
+    @State private var webView: WKWebView?
     var body: some View {
-        let url = try! renderPDFData(MarkdownlView(md: Self.md), named: "readme.pdf")
-        let _ = print(url)
+        let view = HtmlView(html: html) { webView in
+            self.webView = webView
+        }
         VStack(alignment: .leading, spacing: 12) {
             Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-            MarkdownlView(md: Self.md)
-                .frame(maxWidth: .infinity,
+            view.frame(maxWidth: .infinity,
                        maxHeight: .infinity,
                        alignment: .topLeading)
-            HStack {
-                Button("Make PDF") { // text.rectangle.page.fill
-                    do {
-                        pdfURL = try renderPDFData(MarkdownlView(md: Self.md),
-                                                   named: "readme.pdf")
-                        if let u = pdfURL { print(u) }
-                    } catch {
-                        print("PDF error: \(error)")
+            Button(action: {
+                if let wv = webView {
+                    Task {
+                        do {
+                            let c = WKPDFConfiguration()
+                            let data = try await wv.pdf(configuration: c)
+                            print("PDF generated successfully: \(data.count) bytes")
+                            file = URL.documentsDirectory.appendingPathComponent("untitled.pdf")
+                            try? FileManager.default.removeItem(at: file!)
+                            try? data.write(to: file!)
+                        } catch {
+                            print("PDF generation error: \(error)")
+                            file = nil
+                        }
                     }
                 }
-                #if os(iOS)
-                if let u = pdfURL { ShareLink("Share", item: u) }
-                #endif
+            }, label: {
+                Text("PDF")
+            })
+            .font(.title2)
+            if let file {
+                HStack {
+                    Text("PDF Generated!")
+                    ShareLink(item: file, subject: Text("Subject"),
+                           message: Text("message"))
+                }
             }
+
         }
     }
 }
