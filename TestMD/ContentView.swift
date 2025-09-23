@@ -206,7 +206,11 @@ struct ItemView: View {
                     Task {
                         wv.frame.size.width = size.width
                         wv.frame.size.height = 0
+                        #if os(iOS)
                         wv.layoutIfNeeded()
+                        #else
+                        wv.layoutSubtreeIfNeeded()
+                        #endif
                         let contentHeight = await getContentHeight(wv)
                         let pageCount = max(1, Int(ceil(contentHeight / size.height)))
                         print("\(wv.frame.size.width) x \(contentHeight)")
