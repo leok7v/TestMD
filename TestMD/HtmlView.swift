@@ -1,5 +1,14 @@
 import SwiftUI
 import WebKit
+#if os(iOS)
+import UIKit
+typealias HostingController = UIHostingController
+typealias Window            = UIWindow
+#else
+import AppKit
+typealias HostingController = NSHostingController
+typealias Window            = NSWindow
+#endif
 
 public func paperSize() -> CGSize { // A4 or Letter in points
     let A4 = CGSize(width: 595, height: 842) // ~8.3 x 11.7
@@ -15,6 +24,8 @@ public func pageRect() -> CGRect {
     return CGRect(origin: .zero, size: size)
 }
 
+public enum HtmlPdfError: Error { case failed }
+
 private func document(_ html: String,
                       _ css: String,
                       _ cs: ColorScheme,
@@ -27,7 +38,10 @@ private func document(_ html: String,
         rootColors = ":root { --text-color: #24292e; " +
                              "--background-color: #fff; }"
     }
-    let size = paperSize()
+//  let size = paperSize()
+//      @media print {
+//          @page { size: \(size.width)pt \(size.height)pt; margin: 36pt; }
+//      }
     return """
     <!doctype html>
     <html>
@@ -40,9 +54,6 @@ private func document(_ html: String,
         :root { 
             color:      var(--text-color);
             background: var(--background-color);
-        }
-        @media print {
-            @page { size: \(size.width)pt \(size.height)pt; margin: 36pt; }
         }
         html, body { margin: 0; padding: 0; }
         pre { overflow-x: auto; }
@@ -167,23 +178,160 @@ struct HtmlView: ViewRepresentable {
         update(webView, context)
     }
 
+    /* Use UIPrintPageRenderer to paginate and print the web view
+    https://www.swiftdevcenter.com/create-pdf-from-uiview-wkwebview-and-uitableview/#:~:text=We%20are%20going%20to%20create,below%20Extensions%20in%20your%20file)
+    */
+
+    /* On macOS, use NSPrintOperation to save a paginated PDF
+       https://stackoverflow.com/questions/72036111/creating-a-pdf-from-wkwebview-in-macos-11#:~:text=1%20Answer%201)
+    */
+
+    @MainActor
+    public func generatePDF(_ done: @escaping @MainActor @Sendable
+                            (Result<URL, any Error>) -> Void) {
+        Task {
+            var window: Window? = nil
+            let size = paperSize()
+            let rect = pageRect()
+            let margin = 36.0 // 1/2 inch
+            // Make a mutable copy of the incoming view, force light appearance,
+            // and provide a callback to capture the WKWebView when it is ready.
+            var view = self
+            view.forcedColorScheme = .light
+            view.onWebViewReady = { webView in
+                afterLayout(webView) { height in
+                    print("height: \(height)")
+        //          let tmpURL = URL.temporaryDirectory
+        //              .appendingPathComponent(UUID().uuidString + ".pdf")
+                    let file = URL.documentsDirectory
+                        .appendingPathComponent("untitled.pdf")
+                    #if os(iOS)
+                    let formatter = webView.viewPrintFormatter()
+                    let renderer  = UIPrintPageRenderer()
+                    print("renderer.headerHeight: \(renderer.headerHeight)")
+                    print("renderer.footerHeight: \(renderer.footerHeight)")
+                    renderer.headerHeight = margin
+                    renderer.footerHeight = margin
+                    renderer.currentRenderingQuality(forRequested: .best)
+                    renderer.addPrintFormatter(formatter, startingAtPageAt: 0)
+                    let paperRect      = rect
+                    let printableRect  = paperRect.insetBy(dx: margin, dy: 0)
+                    webView.frame      = printableRect
+                    print("isLoading: \(webView.isLoading)")
+                    print("estimatedProgress: \(webView.estimatedProgress)")
+                    print("contentSize: \(webView.scrollView.contentSize)")
+                    renderer.setValue(paperRect,     forKey: "paperRect")
+                    renderer.setValue(printableRect, forKey: "printableRect")
+                    print("printableRect: \(renderer.paperRect)")
+                    print("printableRect: \(renderer.printableRect)")
+                    let data = NSMutableData()
+                    UIGraphicsBeginPDFContextToData(data, rect, nil)
+                    let n = renderer.numberOfPages
+                    renderer.prepare(forDrawingPages: NSMakeRange(0, n))
+                    let bounds = UIGraphicsGetPDFContextBounds()
+                    print("bounds: \(bounds)")
+                    for i in 0 ..< n {
+                        UIGraphicsBeginPDFPage()
+                        renderer.drawPage(at: i, in: bounds)
+                    }
+                    UIGraphicsEndPDFContext()
+                    if data.write(to: file, atomically: true) {
+                        done(.success(file))
+                    } else {
+                        done(.failure(HtmlPdfError.failed))
+                    }
+                    window?.isHidden = false
+                    window = nil
+                #else
+                    let printInfo = NSPrintInfo()
+                    printInfo.paperSize     = size
+                    printInfo.topMargin     = margin
+                    printInfo.bottomMargin  = margin
+                    printInfo.leftMargin    = margin
+                    printInfo.rightMargin   = margin
+                    printInfo.jobDisposition = .save
+                    printInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = file
+                    let op = webView.printOperation(with: printInfo)
+                    op.showsPrintPanel    = false
+                    op.showsProgressPanel = false
+                    op.runModal(for: window!, delegate: nil, didRun: nil, contextInfo: nil)
+                    done(.success(file))
+                    window?.orderOut(nil)
+                    window = nil
+                #endif
+                }
+            }
+            let host = HostingController(rootView: view)
+            host.view.frame = rect
+            #if os(iOS)
+            window = Window(frame: host.view.frame)
+            window?.rootViewController = host
+            window?.isHidden = false
+            #else
+            window = Window(contentRect: rect,
+                            styleMask: .borderless,
+                            backing: .buffered,
+                            defer: false)
+            window?.contentViewController = host
+            window?.makeKeyAndOrderFront(nil)
+            #endif
+        }
+    }
 }
 
 @MainActor
-func toPDF(_ webView: WKWebView) async -> Data? {
+private func contentHeight(_ webView: WKWebView) async -> CGFloat {
     do {
-        #if os(iOS)
-        let c = WKPDFConfiguration()
-        c.rect = CGRect(x: 0, y: 0, width: 600, height: 800)
-        return try await webView.pdf(configuration: c)
-        #else
-        let c = WKPDFConfiguration()
-        c.rect = CGRect(x: 0, y: 0, width: 600, height: 800)
-        return try await webView.pdf(configuration: c)
-        #endif
+        // JavaScript to get the actual document height
+        let heightScript = """
+            Math.max(
+                document.body.scrollHeight,
+                document.body.offsetHeight,
+                document.documentElement.clientHeight,
+                document.documentElement.scrollHeight,
+                document.documentElement.offsetHeight
+            );
+        """
+        
+        let result = try await webView.evaluateJavaScript(heightScript)
+        if let height = result as? CGFloat {
+            return height
+        } else if let height = result as? Double {
+            return CGFloat(height)
+        } else if let height = result as? Int {
+            return CGFloat(height)
+        } else {
+            print("Unexpected height result type: \(type(of: result))")
+            return -1
+        }
     } catch {
-        print("PDF generation error: \(error)")
-        return nil
+        print("Error getting content height: \(error)")
+        return -1
+    }
+}
+
+private func layout(_ wv: WKWebView) {
+    #if os(iOS)
+    wv.layoutIfNeeded()
+    #else
+    wv.layoutSubtreeIfNeeded()
+    #endif
+}
+
+private func afterLayout(_ wv: WKWebView, _ done: @escaping (CGFloat) -> Void) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        let size = paperSize()
+        wv.frame.size.width = size.width
+        wv.frame.size.height = 0
+        layout(wv)
+        Task {
+            let height = await contentHeight(wv)
+            if (height > 0) {
+                wv.frame.size = CGSize(width: size.width, height: height)
+                layout(wv)
+            }
+            DispatchQueue.main.async { done(height) }
+        }
     }
 }
 

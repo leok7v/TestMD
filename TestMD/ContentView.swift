@@ -279,75 +279,44 @@ func createPDF_B(_ wv: WKWebView,
     }
 }
 
-#if os(iOS)
-func createPDF_C(_ wv: WKWebView, completion: @escaping (Result<URL, Error>) -> Void) { // Paginated
-    Task {
-        let content = await layout(wv)
-        let formatter = wv.viewPrintFormatter()
-        let render = UIPrintPageRenderer()
-        render.addPrintFormatter(formatter, startingAtPageAt: 0)
-        let paperRect = pageRect() // Letter or A4 in points
-        let margin = 36.0 // 1/2 inch in points
-        let printableRect = paperRect.insetBy(dx: margin, dy: margin)
-        render.setValue(NSValue(cgRect: paperRect), forKey: "paperRect")
-        render.setValue(NSValue(cgRect: printableRect), forKey: "printableRect")
-        let data = NSMutableData()
-        UIGraphicsBeginPDFContextToData(data, paperRect, nil)
-        var numPages = render.numberOfPages
-        let n = Int(ceil(content.height / printableRect.height))
-        if (numPages < n) {
-            numPages = n
+/*
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("pdf")
+*/
+
+func createPDF_C(_ v: HtmlView) -> URL {
+    let page = paperSize()
+    let url = URL.documentsDirectory
+        .appendingPathComponent("untitled")
+        .appendingPathExtension("pdf")
+    var box = CGRect(origin: .zero, size: page)
+    let ctx = CGContext(url as CFURL, mediaBox: &box, nil)!
+    let margin = 36.0
+    let renderer = ImageRenderer(content: v)
+    renderer.proposedSize = ProposedViewSize(width: page.width, height: nil)
+    renderer.render { size, render in
+        let totalH = max(size.height, page.height)
+        let pages = Int(ceil(totalH / page.height))
+        for i in 0..<pages {
+            ctx.beginPDFPage(nil)
+            ctx.saveGState()
+            ctx.translateBy(x: margin, y: margin)
+            let offset = -(totalH - CGFloat(i + 1) * page.height)
+            ctx.translateBy(x: 0, y: offset)
+            render(ctx)
+            ctx.restoreGState()
+            ctx.endPDFPage()
         }
-        for i in 0..<numPages {
-            UIGraphicsBeginPDFPage()
-            render.drawPage(at: i, in: UIGraphicsGetPDFContextBounds())
-        }
-        UIGraphicsEndPDFContext()
-        // temporaryDirectory does not work for iOS charing
-        let file = URL.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("pdf")
-        do {
-            try data.write(to: file)
-            completion(.success(file))
-        } catch {
-            completion(.failure(error))
-        }
+        ctx.closePDF()
     }
+    return url
+//  let data = try? Data(contentsOf: url)
+//  try? FileManager.default.removeItem(at: url)
+//  return data
 }
 
-#elseif os(macOS)
-import AppKit
-
-func createPDF_C(_ wv: WKWebView, completion: @escaping (Result<URL, Error>) -> Void) {
-    Task {
-        let size = paperSize()
-        let _ = await layout(wv)
-        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
-        let margin = 36.0 // 1/2 inch in in points
-        info.paperSize      = size
-        info.topMargin      = margin
-        info.bottomMargin   = margin
-        info.leftMargin     = margin
-        info.rightMargin    = margin
-        info.jobDisposition = .save
-        let file = URL.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("pdf")
-        let dictionary = info.dictionary()
-        let save = NSPrintInfo.JobDisposition.save.rawValue
-        dictionary[NSPrintInfo.AttributeKey.jobDisposition] = save
-        dictionary[NSPrintInfo.AttributeKey.jobSavingURL]   = file
-        let op = wv.printOperation(with: info)
-        op.showsPrintPanel = false
-        op.showsProgressPanel = false
-        let rect = NSRect(x: 0, y: 0, width: 100, height: 100)
-        let hidden = NSWindow(contentRect: rect,  styleMask: .borderless,
-                                  backing: .buffered, defer: false)
-        op.runModal(for: hidden, delegate: nil, didRun: nil, contextInfo: nil)
-        completion(.success(file))
-    }
-}
+#if os(macOS)
 
 @MainActor
 func save(_ data: Data) throws -> URL?  {
@@ -372,7 +341,7 @@ func save(_ data: Data) throws -> URL?  {
 func saveAs(_ url: URL) throws -> URL?  {
     let data = try? Data(contentsOf: url)
     try? FileManager.default.removeItem(at: url)
-    return save(data)
+    return try? save(data!)
 }
 
 #endif
@@ -387,6 +356,9 @@ struct ItemView: View {
     var body: some View {
         let view = HtmlView(html: html) { webView in
             self.webView = webView
+            #if os(iOS)
+            webView.scrollView.isScrollEnabled = true
+            #endif
         }
         VStack(alignment: .leading, spacing: 12) {
             Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
@@ -419,7 +391,7 @@ struct ItemView: View {
                             }
                         }
                     } else if (ABC == 2) {
-                        createPDF_C(wv) { result in
+                        view.generatePDF() { result in
                             switch result {
                                 case .success(let url):
                                     print("PDF creation successful: \(url)")
