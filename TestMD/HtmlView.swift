@@ -1,21 +1,33 @@
 import SwiftUI
 import WebKit
 
+public func paperSize() -> CGSize { // A4 or Letter in points
+    let A4 = CGSize(width: 595, height: 842) // ~8.3 x 11.7
+    let Letter = CGSize(width: 8.5 * 72, height: 11 * 72)
+    let LetterRegions: Set<String> = ["US", "CA", "MX", "CL", "CO",
+                                      "CR", "PA", "PE", "PH", "PR"]
+    return LetterRegions.contains(Locale.current.region?.identifier ?? "") ?
+           Letter : A4
+}
+
+public func pageRect() -> CGRect {
+    let size = paperSize()
+    return CGRect(origin: .zero, size: size)
+}
+
 private func document(_ html: String,
                       _ css: String,
-                      _ colorScheme: ColorScheme,
-                      _ primary: Color.Resolved,
+                      _ cs: ColorScheme,
                       _ accentColor: Color.Resolved) -> String {
     let rootColors: String
-    let _ = primary // ignore for now since it is always #000000 or #FFFFFF
-    // which is not what is observed in macOS UI... Hmmm...
-    if colorScheme == .dark {
+    if cs == .dark {
         rootColors = ":root { --text-color: #c9d1d9; " +
                              "--background-color: #0d1117; }"
     } else {
         rootColors = ":root { --text-color: #24292e; " +
                              "--background-color: #fff; }"
     }
+    let size = paperSize()
     return """
     <!doctype html>
     <html>
@@ -28,6 +40,9 @@ private func document(_ html: String,
         :root { 
             color:      var(--text-color);
             background: var(--background-color);
+        }
+        @media print {
+            @page { size: \(size.width)pt \(size.height)pt; margin: 36pt; }
         }
         html, body { margin: 0; padding: 0; }
         pre { overflow-x: auto; }
@@ -60,9 +75,10 @@ struct HtmlView: ViewRepresentable {
     
     let html: String
     var onWebViewReady: ((WKWebView) -> Void)? = nil
+    var forcedColorScheme: ColorScheme? = nil
 
-    @Environment(\.self) private var environment
-    @Environment(\.colorScheme) var colorScheme
+    @Environment(\.self) private var environment // for accent color
+    @Environment(\.colorScheme)  var colorScheme
 
     @State private var linkColor: Color.Resolved?
  
@@ -128,27 +144,26 @@ struct HtmlView: ViewRepresentable {
     }
     
     func update(_ webView: WKWebView, _ context: Context) {
-        let css = colorScheme == .dark ? Self.prism_dark : Self.prism_lite
+        webView.navigationDelegate = context.coordinator
+        let cs = forcedColorScheme ?? colorScheme
+        print("dark: \(cs == .dark)")
+        let css = cs == .dark ? Self.prism_dark : Self.prism_lite
         let accentColor = Color.accentColor.resolve(in: environment)
-        let primary = Color.primary.resolve(in: environment)
-        let secondary = Color.secondary.resolve(in: environment)
-        print("primary: \(primary.toHtmlHexString());")
-        print("secondary: \(secondary.toHtmlHexString());")
-        let page = document(html, css, colorScheme, primary, accentColor)
+        let page = document(html, css, colorScheme, accentColor)
         DispatchQueue.main.async {
             webView.loadHTMLString(page, baseURL: Bundle.main.bundleURL)
         }
     }
 
     func makeNSView(context: Context) -> WKWebView { return makeView(context) }
+    
     func updateNSView(_ webView: WKWebView, context: Context) {
-        webView.navigationDelegate = context.coordinator
         update(webView, context)
     }
 
     func makeUIView(context: Context) -> WKWebView  { return makeView(context) }
+    
     func updateUIView(_ webView: WKWebView, context: Context) {
-        webView.navigationDelegate = context.coordinator
         update(webView, context)
     }
 

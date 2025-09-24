@@ -71,21 +71,8 @@ let md = try! String(contentsOfFile: path, encoding: .utf8)
 let markdown = Markdown()
 let html = markdown.parse(md)
 
-func generatePDF(_ view: WKWebView) -> Data? {
-    return nil
-}
-
-private func paper() -> CGSize {
-    let A4 = CGSize(width: 595, height: 842) // in points
-    let Letter = CGSize(width: 612, height: 792)
-    let LetterRegions: Set<String> = ["US", "CA", "MX", "CL", "CO",
-                                      "CR", "PA", "PE", "PH", "PR"]
-    return LetterRegions.contains(Locale.current.region?.identifier ?? "") ?
-           Letter : A4
-}
-
 @MainActor
-private func getContentHeight(_ webView: WKWebView) async -> CGFloat {
+private func contentHeight(_ webView: WKWebView) async -> CGFloat {
     do {
         // JavaScript to get the actual document height
         let heightScript = """
@@ -114,6 +101,21 @@ private func getContentHeight(_ webView: WKWebView) async -> CGFloat {
         return 0 // fallback
     }
 }
+
+@MainActor
+private func layout(_ wv: WKWebView) async -> CGSize {
+    let size = paperSize()
+    wv.frame.size.width = size.width
+    wv.frame.size.height = 0
+    #if os(iOS)
+    wv.layoutIfNeeded()
+    #else
+    wv.layoutSubtreeIfNeeded()
+    #endif
+    let height = await contentHeight(wv)
+    return CGSize(width: size.width, height: height)
+}
+
 
 // PDF Header at the moment of implementation looks like this:
 // 0000  25 50 44 46 2d 31 2e 33  0a 25 c4 e5 f2 e5 eb a7  |%PDF-1.3.%......|
@@ -186,6 +188,197 @@ extension Data {
     }
 }
 
+enum FileError: Error { case writeFailed }
+
+func createPDF_A(_ wv: WKWebView,
+    completionHandler: @escaping @MainActor @Sendable (Result<URL, any Error>)
+                                                        -> Void) {
+    Task {
+        let size = paperSize()
+        let content = await layout(wv)
+        let pageCount = max(1, Int(ceil(content.height / size.height)))
+        print("\(content.width) x \(content.height)")
+        let doc = PDFDocument()
+        doc.documentAttributes = [
+            PDFDocumentAttribute.titleAttribute: "My Document Title",
+            PDFDocumentAttribute.authorAttribute: "John Doe",
+            PDFDocumentAttribute.subjectAttribute: "Document Subject Description",
+            PDFDocumentAttribute.creatorAttribute: "My App Name",
+            PDFDocumentAttribute.producerAttribute: "My Custom PDF Generator",
+            PDFDocumentAttribute.creationDateAttribute: Date(),
+            PDFDocumentAttribute.modificationDateAttribute: Date(),
+            PDFDocumentAttribute.keywordsAttribute: ["keyword1", "keyword2", "important"]
+        ]
+        let c = WKPDFConfiguration()
+        var y = CGFloat(pageCount) * size.height
+        c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
+        let emptyPage = try await wv.pdf(configuration: c)
+        let empty = emptyPage.pdfStreamLength()
+//      emptyPage.hexdump()
+        var count = 0
+        print("emptyPage: \(emptyPage.count) bytes pdfStreamLength: \(emptyPage.pdfStreamLength())")
+        for i in 0..<pageCount {
+            do {
+                y = CGFloat(i) * size.height
+                c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
+                let data = try await wv.pdf(configuration: c)
+                print("Page[\(i)]: \(data.count) bytes pdfStreamLength: \(data.pdfStreamLength())")
+                let length = data.pdfStreamLength()
+                // iOS implementation of WebKit sucks in .pdf() and
+                // generates 2 empty pages at the end of 7 pages document
+                if (empty > 0 && length > 0 && length <= empty + 16) {
+                    // skip empty pages
+                    // emptyPage.hexdump()
+                } else {
+                    let pd = PDFDocument(data: data)
+                    let page = pd!.page(at: 0)?.copy() as! PDFPage
+                    doc.insert(page, at: count)
+                    count += 1
+                }
+            } catch {
+                print("PDF generation error: \(error)")
+                completionHandler(.failure(error))
+                return
+            }
+        }
+        print("pageCount: \(pageCount) doc.pageCount: \(doc.pageCount)")
+        let file = URL.documentsDirectory.appendingPathComponent("untitled.pdf")
+        try? FileManager.default.removeItem(at: file)
+        if doc.write(to: file) {
+            completionHandler(.success(file))
+        } else {
+            completionHandler(.failure(FileError.writeFailed))
+        }
+    }
+}
+
+func createPDF_B(_ wv: WKWebView,
+               _ completionHandler: @escaping @MainActor @Sendable (Result<URL, any Error>) -> Void) {
+    Task {
+        let content = await layout(wv)
+        let cfg = WKPDFConfiguration()
+        cfg.rect = .init(origin: .zero, size: content)
+        cfg.allowTransparentBackground = false
+        wv.createPDF(configuration: cfg) { result in
+            switch result {
+                case .success(let data):
+                    print("PDF creation successful: \(data.count) bytes")
+                    let file = URL.documentsDirectory.appendingPathComponent("untitled.pdf")
+                    try? FileManager.default.removeItem(at: file)
+                    do {
+                        try data.write(to: file)
+                        completionHandler(.success(file))
+                    } catch {
+                        completionHandler(.failure(error))
+                    }
+                case .failure(let error):
+                    print("PDF creation failed with error: \(error.localizedDescription)")
+                    completionHandler(.failure(error))
+            }
+        }
+    }
+}
+
+#if os(iOS)
+func createPDF_C(_ wv: WKWebView, completion: @escaping (Result<URL, Error>) -> Void) { // Paginated
+    Task {
+        let content = await layout(wv)
+        let formatter = wv.viewPrintFormatter()
+        let render = UIPrintPageRenderer()
+        render.addPrintFormatter(formatter, startingAtPageAt: 0)
+        let paperRect = pageRect() // Letter or A4 in points
+        let margin = 36.0 // 1/2 inch in points
+        let printableRect = paperRect.insetBy(dx: margin, dy: margin)
+        render.setValue(NSValue(cgRect: paperRect), forKey: "paperRect")
+        render.setValue(NSValue(cgRect: printableRect), forKey: "printableRect")
+        let data = NSMutableData()
+        UIGraphicsBeginPDFContextToData(data, paperRect, nil)
+        var numPages = render.numberOfPages
+        let n = Int(ceil(content.height / printableRect.height))
+        if (numPages < n) {
+            numPages = n
+        }
+        for i in 0..<numPages {
+            UIGraphicsBeginPDFPage()
+            render.drawPage(at: i, in: UIGraphicsGetPDFContextBounds())
+        }
+        UIGraphicsEndPDFContext()
+        // temporaryDirectory does not work for iOS charing
+        let file = URL.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("pdf")
+        do {
+            try data.write(to: file)
+            completion(.success(file))
+        } catch {
+            completion(.failure(error))
+        }
+    }
+}
+
+#elseif os(macOS)
+import AppKit
+
+func createPDF_C(_ wv: WKWebView, completion: @escaping (Result<URL, Error>) -> Void) {
+    Task {
+        let size = paperSize()
+        let _ = await layout(wv)
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        let margin = 36.0 // 1/2 inch in in points
+        info.paperSize      = size
+        info.topMargin      = margin
+        info.bottomMargin   = margin
+        info.leftMargin     = margin
+        info.rightMargin    = margin
+        info.jobDisposition = .save
+        let file = URL.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("pdf")
+        let dictionary = info.dictionary()
+        let save = NSPrintInfo.JobDisposition.save.rawValue
+        dictionary[NSPrintInfo.AttributeKey.jobDisposition] = save
+        dictionary[NSPrintInfo.AttributeKey.jobSavingURL]   = file
+        let op = wv.printOperation(with: info)
+        op.showsPrintPanel = false
+        op.showsProgressPanel = false
+        let rect = NSRect(x: 0, y: 0, width: 100, height: 100)
+        let hidden = NSWindow(contentRect: rect,  styleMask: .borderless,
+                                  backing: .buffered, defer: false)
+        op.runModal(for: hidden, delegate: nil, didRun: nil, contextInfo: nil)
+        completion(.success(file))
+    }
+}
+
+@MainActor
+func save(_ data: Data) throws -> URL?  {
+    var url : URL? = nil
+    let savePanel = NSSavePanel()
+    savePanel.nameFieldStringValue = "document.pdf"
+    savePanel.begin { response in
+        if response == .OK, let u = savePanel.url {
+            do {
+                try data.write(to: u)
+                url = u
+            } catch {
+                print("Failed to write to: \(url!.lastPathComponent) " +
+                      "because of \"\(error.localizedDescription)\"")
+            }
+        }
+    }
+    return url
+}
+
+@MainActor
+func saveAs(_ url: URL) throws -> URL?  {
+    let data = try? Data(contentsOf: url)
+    try? FileManager.default.removeItem(at: url)
+    return save(data)
+}
+
+#endif
+
+let ABC = 2
+
 struct ItemView: View {
     let item: Item
     @State var file: URL?
@@ -202,66 +395,39 @@ struct ItemView: View {
                        alignment: .topLeading)
             Button(action: {
                 if let wv = webView {
-                    let size = paper()
-                    Task {
-                        wv.frame.size.width = size.width
-                        wv.frame.size.height = 0
-                        #if os(iOS)
-                        wv.layoutIfNeeded()
-                        #else
-                        wv.layoutSubtreeIfNeeded()
-                        #endif
-                        let contentHeight = await getContentHeight(wv)
-                        let pageCount = max(1, Int(ceil(contentHeight / size.height)))
-                        print("\(wv.frame.size.width) x \(contentHeight)")
-                        let doc = PDFDocument()
-                        doc.documentAttributes = [
-                            PDFDocumentAttribute.titleAttribute: "My Document Title",
-                            PDFDocumentAttribute.authorAttribute: "John Doe",
-                            PDFDocumentAttribute.subjectAttribute: "Document Subject Description",
-                            PDFDocumentAttribute.creatorAttribute: "My App Name",
-                            PDFDocumentAttribute.producerAttribute: "My Custom PDF Generator",
-                            PDFDocumentAttribute.creationDateAttribute: Date(),
-                            PDFDocumentAttribute.modificationDateAttribute: Date(),
-                            PDFDocumentAttribute.keywordsAttribute: ["keyword1", "keyword2", "important"]
-                        ]
-                        let c = WKPDFConfiguration()
-                        var y = CGFloat(pageCount) * size.height
-                        c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
-                        let emptyPage = try await wv.pdf(configuration: c)
-                        let empty = emptyPage.pdfStreamLength()
-//                      emptyPage.hexdump()
-                        var count = 0
-                        print("emptyPage: \(emptyPage.count) bytes pdfStreamLength: \(emptyPage.pdfStreamLength())")
-                        for i in 0..<pageCount {
-                            do {
-                                y = CGFloat(i) * size.height
-                                c.rect = CGRect(x: 0, y: y, width: size.width, height: size.height)
-                                let data = try await wv.pdf(configuration: c)
-                                print("Page[\(i)]: \(data.count) bytes pdfStreamLength: \(data.pdfStreamLength())")
-                                let length = data.pdfStreamLength()
-                                // iOS implementation of WebKit sucks in .pdf() and
-                                // generates 2 empty pages at the end of 7 pages document
-                                if (empty > 0 && length > 0 && length <= empty + 16) {
-                                    // skip empty pages
-                                    // emptyPage.hexdump()
-                                } else {
-                                    let pd = PDFDocument(data: data)
-                                    let page = pd!.page(at: 0)?.copy() as! PDFPage
-                                    doc.insert(page, at: count)
-                                    count += 1
-                                }
-                            } catch {
-                                print("PDF generation error: \(error)")
+                    if (ABC == 0) {
+                        createPDF_A(wv) { result in
+                            print("Result: \(result)")
+                            switch result {
+                            case .success(let url):
+                                print("PDF creation successful.")
+                                file = url
+                            case .failure(let error):
                                 err = error
-                                break
+                                print("PDF creation failed with error: \(error.localizedDescription)")
                             }
                         }
-                        if (err == nil) {
-                            print("pageCount: \(pageCount) doc.pageCount: \(doc.pageCount)")
-                            file = URL.documentsDirectory.appendingPathComponent("untitled.pdf")
-                            try? FileManager.default.removeItem(at: file!)
-                            doc.write(to: file!)
+                    } else if (ABC == 1) {
+                        createPDF_B(wv) { result in
+                            switch result {
+                                case .success(let url):
+                                    print("PDF creation successful: \(url)")
+                                    file = url
+                                case .failure(let error):
+                                    print("PDF creation failed with error: \(error.localizedDescription)")
+                                    err = error
+                            }
+                        }
+                    } else if (ABC == 2) {
+                        createPDF_C(wv) { result in
+                            switch result {
+                                case .success(let url):
+                                    print("PDF creation successful: \(url)")
+                                    file = url
+                                case .failure(let error):
+                                    print("PDF creation failed with error: \(error.localizedDescription)")
+                                    err = error
+                            }
                         }
                     }
                 }
@@ -278,10 +444,10 @@ struct ItemView: View {
                     ShareLink(item: file, subject: Text("Subject: abc"))
                 }
             }
-
         }
     }
 }
+
 
 #Preview {
     ContentView()
