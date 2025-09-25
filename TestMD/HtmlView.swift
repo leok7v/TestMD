@@ -24,24 +24,39 @@ public func pageRect() -> CGRect {
     return CGRect(origin: .zero, size: size)
 }
 
-public enum HtmlPdfError: Error { case failed }
+enum HTMLPDFError: Error {
+    case failed(_ reason: String)
+}
 
-private func document(_ html: String,
+func documentColors(_ printing: Bool, _ cs: ColorScheme) -> String {
+    if printing {
+        if cs == .dark {
+            return "body { color: white;\n" +
+               "background-color: black;\n" +
+                          "}\n"
+        } else {
+            return "body { color: black;\n" +
+               "background-color: white;\n" +
+                          "}\n"
+        }
+    } else {
+        if cs == .dark {
+            return "body { color: #c9d1d9;\n" +
+               "background-color: #0d1117;\n" +
+                          "}\n"
+        } else {
+            return "body { color: #24292e;\n" + // #24292e
+               "background-color: #f0f0f0;\n" +
+                          "}\n"
+        }
+    }
+}
+
+private func document(_ printing: Bool,
+                      _ html: String,
                       _ css: String,
                       _ cs: ColorScheme,
                       _ accentColor: Color.Resolved) -> String {
-    let rootColors: String
-    if cs == .dark {
-        rootColors = ":root { --text-color: #c9d1d9; " +
-                             "--background-color: #0d1117; }"
-    } else {
-        rootColors = ":root { --text-color: #24292e; " +
-                             "--background-color: #fff; }"
-    }
-//  let size = paperSize()
-//      @media print {
-//          @page { size: \(size.width)pt \(size.height)pt; margin: 36pt; }
-//      }
     return """
     <!doctype html>
     <html>
@@ -49,12 +64,8 @@ private func document(_ html: String,
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-        \(rootColors)
+        \(documentColors(printing, cs))
         \(css)
-        :root { 
-            color:      var(--text-color);
-            background: var(--background-color);
-        }
         html, body { margin: 0; padding: 0; }
         pre { overflow-x: auto; }
         code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -82,10 +93,13 @@ typealias ViewRepresentable = NSViewRepresentable
 typealias Context = NSViewRepresentableContext<HtmlView>
 #endif
 
+let margin = 36.0 // 1/2 inch PDF insets margin
+
 struct HtmlView: ViewRepresentable {
     
     let html: String
     var onWebViewReady: ((WKWebView) -> Void)? = nil
+    var printing = false
     var forcedColorScheme: ColorScheme? = nil
 
     @Environment(\.self) private var environment // for accent color
@@ -129,7 +143,8 @@ struct HtmlView: ViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     static let dark = Bundle.main.path(forResource: "prism-dark",    ofType: "css")!
-    static let lite = Bundle.main.path(forResource: "prism-default", ofType: "css")!
+//  static let lite = Bundle.main.path(forResource: "prism-default", ofType: "css")!
+    static let lite = Bundle.main.path(forResource: "prism-coy",     ofType: "css")!
     
     static let prism_dark = try! String(contentsOfFile: dark, encoding: .utf8)
     static let prism_lite = try! String(contentsOfFile: lite, encoding: .utf8)
@@ -160,7 +175,7 @@ struct HtmlView: ViewRepresentable {
         print("dark: \(cs == .dark)")
         let css = cs == .dark ? Self.prism_dark : Self.prism_lite
         let accentColor = Color.accentColor.resolve(in: environment)
-        let page = document(html, css, colorScheme, accentColor)
+        let page = document(printing, html, css, cs, accentColor)
         DispatchQueue.main.async {
             webView.loadHTMLString(page, baseURL: Bundle.main.bundleURL)
         }
@@ -193,76 +208,33 @@ struct HtmlView: ViewRepresentable {
             var window: Window? = nil
             let size = paperSize()
             let rect = pageRect()
-            let margin = 36.0 // 1/2 inch
-            // Make a mutable copy of the incoming view, force light appearance,
-            // and provide a callback to capture the WKWebView when it is ready.
+            // .dark theme PDF generation is much more involved - we will
+            // need dark background color and it does not print well on paper
             var view = self
             view.forcedColorScheme = .light
-            view.onWebViewReady = { webView in
-                afterLayout(webView) { height in
+            view.printing = true
+            view.onWebViewReady = { wv in
+                afterLayout(wv) { height in
                     print("height: \(height)")
-        //          let tmpURL = URL.temporaryDirectory
-        //              .appendingPathComponent(UUID().uuidString + ".pdf")
-                    let file = URL.documentsDirectory
-                        .appendingPathComponent("untitled.pdf")
-                    #if os(iOS)
-                    let formatter = webView.viewPrintFormatter()
-                    let renderer  = UIPrintPageRenderer()
-                    print("renderer.headerHeight: \(renderer.headerHeight)")
-                    print("renderer.footerHeight: \(renderer.footerHeight)")
-                    renderer.headerHeight = margin
-                    renderer.footerHeight = margin
-                    renderer.currentRenderingQuality(forRequested: .best)
-                    renderer.addPrintFormatter(formatter, startingAtPageAt: 0)
-                    let paperRect      = rect
-                    let printableRect  = paperRect.insetBy(dx: margin, dy: 0)
-                    webView.frame      = printableRect
-                    print("isLoading: \(webView.isLoading)")
-                    print("estimatedProgress: \(webView.estimatedProgress)")
-                    print("contentSize: \(webView.scrollView.contentSize)")
-                    renderer.setValue(paperRect,     forKey: "paperRect")
-                    renderer.setValue(printableRect, forKey: "printableRect")
-                    print("printableRect: \(renderer.paperRect)")
-                    print("printableRect: \(renderer.printableRect)")
-                    let data = NSMutableData()
-                    UIGraphicsBeginPDFContextToData(data, rect, nil)
-                    let n = renderer.numberOfPages
-                    renderer.prepare(forDrawingPages: NSMakeRange(0, n))
-                    let bounds = UIGraphicsGetPDFContextBounds()
-                    print("bounds: \(bounds)")
-                    for i in 0 ..< n {
-                        UIGraphicsBeginPDFPage()
-                        renderer.drawPage(at: i, in: bounds)
-                    }
-                    UIGraphicsEndPDFContext()
-                    if data.write(to: file, atomically: true) {
-                        done(.success(file))
-                    } else {
-                        done(.failure(HtmlPdfError.failed))
-                    }
-                    window?.isHidden = false
+                #if os(iOS)
+                    let renderer  = PrintPageRenderer()
+                    renderer.printToPdf(wv, rect, done)
+                    window?.isHidden = true
                     window = nil
-                #else
-                    let printInfo = NSPrintInfo()
-                    printInfo.paperSize     = size
-                    printInfo.topMargin     = margin
-                    printInfo.bottomMargin  = margin
-                    printInfo.leftMargin    = margin
-                    printInfo.rightMargin   = margin
-                    printInfo.jobDisposition = .save
-                    printInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = file
-                    let op = webView.printOperation(with: printInfo)
-                    op.showsPrintPanel    = false
-                    op.showsProgressPanel = false
-                    op.runModal(for: window!, delegate: nil, didRun: nil, contextInfo: nil)
-                    done(.success(file))
-                    window?.orderOut(nil)
-                    window = nil
+                #elseif os(macOS)
+                    let renderer = PrintPageRenderer()
+                    renderer.printToPDF(window!, wv, size) { result in
+                        switch result {
+                            case .success(let file):  done(.success(file))
+                            case .failure(let error): done(.failure(error))
+                        }
+                        window?.orderOut(nil)
+                        window = nil
+                    }
                 #endif
                 }
             }
             let host = HostingController(rootView: view)
-            host.view.frame = rect
             #if os(iOS)
             window = Window(frame: host.view.frame)
             window?.rootViewController = host
@@ -273,11 +245,112 @@ struct HtmlView: ViewRepresentable {
                             backing: .buffered,
                             defer: false)
             window?.contentViewController = host
-            window?.makeKeyAndOrderFront(nil)
             #endif
         }
     }
 }
+
+#if os(iOS)
+
+final class PrintPageRenderer : UIPrintPageRenderer {
+
+    func printToPdf(_ webView: WKWebView, _ rect: CGRect,
+                            _ done: @escaping @MainActor @Sendable
+                            (Result<URL, any Error>) -> Void) {
+        let file = URL.temporaryDirectory
+            .appendingPathComponent("Untitled.pdf")
+//      let file = URL.documentsDirectory
+//          .appendingPathComponent("untitled.pdf")
+        let formatter = webView.viewPrintFormatter()
+        let renderer  = self
+        renderer.headerHeight = margin
+        renderer.footerHeight = margin
+        renderer.currentRenderingQuality(forRequested: .best)
+        renderer.addPrintFormatter(formatter, startingAtPageAt: 0)
+        let paperRect      = rect
+        let printableRect  = paperRect.insetBy(dx: margin, dy: 0)
+        webView.frame      = printableRect
+        renderer.setValue(paperRect,     forKey: "paperRect")
+        renderer.setValue(printableRect, forKey: "printableRect")
+        let data = NSMutableData()
+        UIGraphicsBeginPDFContextToData(data, rect, nil)
+        let n = renderer.numberOfPages
+        renderer.prepare(forDrawingPages: NSMakeRange(0, n))
+        let bounds = UIGraphicsGetPDFContextBounds()
+        let footer = CGRect(x: margin, y:bounds.height,
+            width: bounds.width - margin * 2, height: margin)
+        for i in 0 ..< n {
+            UIGraphicsBeginPDFPage()
+            renderer.drawPage(at: i, in: bounds)
+            renderer.drawFooterForPage(at: i, in: footer)
+        }
+        UIGraphicsEndPDFContext()
+        if data.write(to: file, atomically: true) {
+            done(.success(file))
+        } else {
+            done(.failure(HTMLPDFError.failed("something went wrong")))
+        }
+    }
+
+    override func drawFooterForPage(at page: Int, in rect: CGRect) {
+        if (self.numberOfPages <= 1) { return } // not footer for single page
+        let s = "\(page + 1)"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 12),
+            .foregroundColor: UIColor.gray
+        ]
+        let size = s.size(withAttributes: attributes)
+        let x = rect.origin.x + (rect.width  - size.width) / 2
+        let y = rect.origin.y + (rect.height - size.height) / 2
+        let rect = CGRect(x: x, y: y, width: size.width, height: size.height)
+        s.draw(in: rect, withAttributes: attributes)
+    }
+
+}
+
+#elseif os(macOS)
+
+final class PrintPageRenderer : NSObject {
+
+    private var file: URL?
+    private var done: ((Result<URL, Error>) -> Void)?
+
+    func printToPDF(_ window: NSWindow,
+                    _ wv: WKWebView,
+                    _ size: NSSize,
+                    _ done: @escaping (Result<URL, Error>) -> Void) {
+        let file = URL.temporaryDirectory
+            .appendingPathComponent("Untitled.pdf")
+        self.file = file
+        self.done = done
+        let info = NSPrintInfo()
+        info.paperSize     = size
+        info.topMargin     = margin
+        info.bottomMargin  = margin
+        info.leftMargin    = margin
+        info.rightMargin   = margin
+        info.jobDisposition = .save
+        let dic = info.dictionary()
+        let savingURL  = NSPrintInfo.AttributeKey.jobSavingURL
+        dic[savingURL] = file
+        dic[NSAttributedString.Key.font] = NSFont.systemFont(ofSize: 12)
+        dic[NSAttributedString.Key.foregroundColor] = NSColor.green
+        wv.printOperation(with: info)
+        let op = wv.printOperation(with: info)
+        op.showsPrintPanel    = false
+        op.showsProgressPanel = false
+        let pv = op.view! // WKPrintingView
+        pv.frame = NSRect(origin: .zero, size: size)
+        pv.needsLayout = true
+        pv.layoutSubtreeIfNeeded()
+        pv.layout()
+        op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+        done(.success(file))
+    }
+
+}
+
+#endif
 
 @MainActor
 private func contentHeight(_ webView: WKWebView) async -> CGFloat {
